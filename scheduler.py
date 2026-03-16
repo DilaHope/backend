@@ -1,22 +1,21 @@
 """
 Scheduler : pipeline de scoring avec publication progressive.
-- Les coins sont ajoutés au cache AU FUR ET À MESURE (pas en fin de cycle)
-- Le cache est sauvegardé dans cache.json pour survivre aux redémarrages / rate limits
+Cache JSON persistant sur disque.
 """
-
 import time
 import json
-import os
 from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
+
 from config import REFRESH_INTERVAL_MINUTES, COINS_PAGES
+from filters import is_valid
 from scoring import compute_score
 from services.coingecko import get_small_cap_coins, get_coin_detail
-from services.dexscreener import get_best_liquidity
+from services.dexscreener import get_dex_data
+from services.defillama import get_tvl_for_symbol
 
 CACHE_FILE = Path(__file__).parent / "cache.json"
 
-# Cache global : dict indexé par coin id pour éviter les doublons
 ranking_cache: list[dict] = []
 last_update: str = ""
 is_updating: bool = False
@@ -25,7 +24,6 @@ scheduler = BackgroundScheduler()
 
 
 def _load_cache_from_disk() -> None:
-    """Charge le cache depuis cache.json au démarrage."""
     global ranking_cache, last_update
     if CACHE_FILE.exists():
         try:
@@ -33,25 +31,20 @@ def _load_cache_from_disk() -> None:
                 saved = json.load(f)
             ranking_cache = saved.get("top", [])
             last_update   = saved.get("last_update", "")
-            print(f"[Cache] {len(ranking_cache)} coins chargés depuis le disque ({last_update})")
+            print(f"[Cache] {len(ranking_cache)} coins chargés ({last_update})")
         except Exception as e:
-            print(f"[Cache] Erreur lecture cache.json: {e}")
+            print(f"[Cache] Erreur lecture: {e}")
 
 
 def _save_cache_to_disk() -> None:
-    """Persiste le cache courant dans cache.json."""
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump({"last_update": last_update, "top": ranking_cache}, f, ensure_ascii=False)
     except Exception as e:
-        print(f"[Cache] Erreur écriture cache.json: {e}")
+        print(f"[Cache] Erreur écriture: {e}")
 
 
 def _upsert(coin: dict) -> None:
-    """
-    Ajoute ou met à jour un coin dans le cache global par son id.
-    Retrie le cache par score décroissant après chaque insertion.
-    """
     global ranking_cache
     ranking_cache = [c for c in ranking_cache if c["id"] != coin["id"]]
     ranking_cache.append(coin)
@@ -59,10 +52,6 @@ def _upsert(coin: dict) -> None:
 
 
 def update_ranking() -> None:
-    """
-    Pipeline complet avec publication progressive :
-    chaque coin scoré est immédiatement disponible via /ranking.
-    """
     global last_update, is_updating
     if is_updating:
         print("[Scheduler] Mise à jour déjà en cours, skip.")
@@ -73,58 +62,96 @@ def update_ranking() -> None:
 
     try:
         raw_coins = get_small_cap_coins(pages=COINS_PAGES)
-        print(f"[Scheduler] {len(raw_coins)} small caps à scorer")
+        print(f"[Scheduler] {len(raw_coins)} small caps récupérés")
 
-        for i, coin in enumerate(raw_coins):
-            coin_id = coin.get("id", "")
-            symbol  = coin.get("symbol", "")
-            mc      = coin.get("market_cap") or 1
-            vol     = coin.get("total_volume") or 0
-            fdv     = coin.get("fully_diluted_valuation") or mc * 2
+        for i, raw in enumerate(raw_coins):
+            coin_id = raw.get("id", "")
+            symbol  = raw.get("symbol", "")
+            mc      = raw.get("market_cap") or 1
+            vol     = raw.get("total_volume") or 0
 
-            detail      = get_coin_detail(coin_id)
-            dev_data    = detail.get("developer_data") or {}
-            community   = detail.get("community_data") or {}
-            platforms   = detail.get("platforms") or {}
-            liquidity   = get_best_liquidity(symbol, platforms)
+            # Détail CoinGecko (dev, community, platforms, categories, description)
+            detail     = get_coin_detail(coin_id)
+            dev_data   = detail.get("developer_data") or {}
+            community  = detail.get("community_data") or {}
+            platforms  = detail.get("platforms") or {}
+            categories = detail.get("categories") or []
+            description = (detail.get("description") or {}).get("en") or ""
 
-            score = compute_score(
-                market_cap=mc,
-                volume_24h=vol,
-                fdv=fdv,
-                liquidity_usd=liquidity,
-                dev_data=dev_data,
-                community_data=community,
-            )
+            # DexScreener (liquidité, volume DEX, age paire)
+            dex = get_dex_data(symbol, platforms)
 
-            entry = {
-                "id":                coin_id,
-                "name":              coin.get("name"),
-                "symbol":            symbol.upper(),
-                "price":             coin.get("current_price"),
-                "market_cap":        round(mc, 0),
-                "volume_24h":        round(vol, 0),
-                "fdv":               round(fdv, 0),
-                "liquidity_usd":     round(liquidity, 0),
-                "score":             score,
-                "twitter_followers": community.get("twitter_followers"),
-                "github_stars":      dev_data.get("stars"),
-                "image":             coin.get("image"),
+            # DefiLlama TVL (bonus pour projets DeFi)
+            tvl = get_tvl_for_symbol(symbol)
+
+            # Construire le coin enrichi pour le scoring
+            coin = {
+                "id":            coin_id,
+                "name":          raw.get("name"),
+                "symbol":        symbol.upper(),
+                "price":         raw.get("current_price"),
+                "market_cap":    mc,
+                "volume_24h":    vol,
+                "fdv":           raw.get("fully_diluted_valuation") or mc * 2,
+                "liquidity":     dex["liquidity"],
+                "dex_volume_24h": dex["dex_volume_24h"],
+                "pair_age_days": dex["pair_age_days"],
+                "tvl":           tvl,
+                "dev_data":      dev_data,
+                "community_data": community,
+                "categories":    categories,
+                "description":   description,
+                # Holders / whales : non disponibles sans API on-chain payante
+                # → valeurs neutres (pas de pénalité injuste)
+                "holders_today":      0,
+                "holders_week":       0,
+                "top10_wallets_pct":  0,
+                "whale_buy_volume":   0,
+                "whale_sell_volume":  0,
+                "image":         raw.get("image"),
             }
 
-            # Publication immédiate dans le cache + sauvegarde disque
+            # Filtre qualité
+            if not is_valid(coin):
+                continue
+
+            score = compute_score(coin)
+            sub   = coin.pop("_scores", {})
+
+            entry = {
+                "id":                          coin_id,
+                "name":                        coin["name"],
+                "symbol":                      coin["symbol"],
+                "price":                       coin["price"],
+                "market_cap":                  round(mc, 0),
+                "volume_24h":                  round(vol, 0),
+                "liquidity":                   round(dex["liquidity"], 0),
+                "dex_volume_24h":              round(dex["dex_volume_24h"], 0),
+                "pair_age_days":               round(dex["pair_age_days"], 1),
+                "tvl":                         round(tvl, 0),
+                "twitter_followers":           community.get("twitter_followers"),
+                "github_commits_month":        dev_data.get("commit_count_4_weeks"),
+                "github_stars":                dev_data.get("stars"),
+                "dominant_narrative":          sub.get("dominant_narrative"),
+                "narrative_score":             sub.get("narrative_score"),
+                "whale_activity_score":        sub.get("whale_activity_score"),
+                "cex_listing_potential_score": sub.get("cex_listing_potential_score"),
+                "manipulation_score":          sub.get("manipulation_score"),
+                "score":                       score,
+                "image":                       coin["image"],
+            }
+
             _upsert(entry)
             last_update = time.strftime("%Y-%m-%d %H:%M:%S")
             _save_cache_to_disk()
 
             if (i + 1) % 10 == 0:
-                print(f"[Scheduler] {i+1}/{len(raw_coins)} scorés — top score: {ranking_cache[0]['score'] if ranking_cache else 0}")
+                top = ranking_cache[0]["score"] if ranking_cache else 0
+                print(f"[Scheduler] {i+1}/{len(raw_coins)} scorés — top: {top}")
 
             time.sleep(1.5)
 
-        last_update = time.strftime("%Y-%m-%d %H:%M:%S")
-        _save_cache_to_disk()
-        print(f"[Scheduler] ✅ Cycle terminé — {len(ranking_cache)} coins dans le cache — {last_update}")
+        print(f"[Scheduler] ✅ Cycle terminé — {len(ranking_cache)} coins — {last_update}")
 
     except Exception as e:
         print(f"[Scheduler] Erreur inattendue: {e}")

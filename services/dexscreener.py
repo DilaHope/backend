@@ -1,62 +1,77 @@
 """
-Service DexScreener : récupère la liquidité USD maximale
-parmi toutes les paires d'un token sur les DEX.
+DexScreener : liquidité, volume DEX, age des paires.
 """
-
 import requests
 from config import DEXSCREENER_BASE, TIMEOUT_DEX
+from datetime import datetime, timezone
 
 
-def _liquidity_from_pairs(pairs: list) -> float:
+def _best_pair(pairs: list) -> dict:
+    """Retourne la paire avec la liquidité maximale."""
     if not pairs:
-        return 0.0
-    return max((p.get("liquidity", {}).get("usd") or 0) for p in pairs)
+        return {}
+    return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
 
 
-def get_best_liquidity(symbol: str, contract_addresses: dict | None = None) -> float:
-    """
-    Cherche le token par symbole sur DexScreener.
-    Si le symbole est trop court (< 2 chars), utilise les adresses de contrat à la place.
-    Retourne la liquidité USD de la meilleure paire (la plus liquide).
-    Retourne 0.0 si aucune paire trouvée ou erreur.
-    """
-    # Symbole trop court → fallback sur adresse de contrat
-    if not symbol or len(symbol) < 2:
-        if not contract_addresses:
-            return 0.0
-        return _get_liquidity_by_contract(contract_addresses)
+def _pair_age_days(pair: dict) -> float:
+    """Calcule l'âge de la paire en jours depuis sa création."""
+    created_ms = pair.get("pairCreatedAt")
+    if not created_ms:
+        return 999
+    created = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
+    return (datetime.now(tz=timezone.utc) - created).days
 
+
+def _fetch_pairs(query: str) -> list:
     try:
-        response = requests.get(
+        r = requests.get(
             f"{DEXSCREENER_BASE}/search",
-            params={"q": symbol},
+            params={"q": query},
             timeout=TIMEOUT_DEX,
         )
-        response.raise_for_status()
-        return _liquidity_from_pairs(response.json().get("pairs") or [])
-
-    except requests.RequestException as e:
-        print(f"[DexScreener] Erreur {symbol}: {e}")
-        return 0.0
+        r.raise_for_status()
+        return r.json().get("pairs") or []
+    except requests.RequestException:
+        return []
 
 
-def _get_liquidity_by_contract(platforms: dict) -> float:
+def _fetch_pairs_by_address(address: str) -> list:
+    try:
+        r = requests.get(
+            f"{DEXSCREENER_BASE}/tokens/{address}",
+            timeout=TIMEOUT_DEX,
+        )
+        r.raise_for_status()
+        return r.json().get("pairs") or []
+    except requests.RequestException:
+        return []
+
+
+def get_dex_data(symbol: str, platforms: dict | None = None) -> dict:
     """
-    Interroge DexScreener via adresse de contrat pour les tokens à symbole trop court.
-    `platforms` est le dict CoinGecko : {"ethereum": "0x...", "bsc": "0x...", ...}
+    Retourne : liquidity, dex_volume_24h, pair_age_days.
+    Fallback sur adresse de contrat si symbole trop court.
     """
-    for chain, address in platforms.items():
-        if not address:
-            continue
-        try:
-            response = requests.get(
-                f"{DEXSCREENER_BASE}/tokens/{address}",
-                timeout=TIMEOUT_DEX,
-            )
-            response.raise_for_status()
-            liquidity = _liquidity_from_pairs(response.json().get("pairs") or [])
-            if liquidity > 0:
-                return liquidity
-        except requests.RequestException as e:
-            print(f"[DexScreener] Erreur contrat {address}: {e}")
-    return 0.0
+    pairs = []
+
+    if symbol and len(symbol) >= 2:
+        pairs = _fetch_pairs(symbol)
+
+    if not pairs and platforms:
+        for address in platforms.values():
+            if address:
+                pairs = _fetch_pairs_by_address(address)
+                if pairs:
+                    break
+
+    if not pairs:
+        return {"liquidity": 0.0, "dex_volume_24h": 0.0, "pair_age_days": 999}
+
+    best = _best_pair(pairs)
+    total_volume = sum((p.get("volume") or {}).get("h24") or 0 for p in pairs)
+
+    return {
+        "liquidity":     (best.get("liquidity") or {}).get("usd") or 0.0,
+        "dex_volume_24h": total_volume,
+        "pair_age_days": _pair_age_days(best),
+    }
