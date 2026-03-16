@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: crypto-gem-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://ton-app.vercel.app
