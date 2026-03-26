@@ -59,8 +59,6 @@ def community_score(community_data: dict) -> float:
 
 def holder_score(holders_today: int, holders_week: int) -> float:
     """Croissance holders sur 7 jours × 5, plafonné à 1."""
-    if holders_week <= 0:
-        return 0.0
     growth = (holders_today - holders_week) / holders_week
     return min(max(growth * 5, 0.0), 1.0)
 
@@ -163,7 +161,7 @@ def compute_score(coin: dict) -> float:
     dev_data    = coin.get("dev_data") or {}
     community   = coin.get("community_data") or {}
     holders_now = coin.get("holders_today") or 0
-    holders_7d  = coin.get("holders_week") or 0
+    holders_7d  = max(coin.get("holders_week") or 0, 1)
     pair_age    = coin.get("pair_age_days") or 999
     twitter     = community.get("twitter_followers") or 0
     top10_pct   = coin.get("top10_wallets_pct") or 0
@@ -177,7 +175,7 @@ def compute_score(coin: dict) -> float:
     commits = (dev_data.get("commit_count_4_weeks") or
                dev_data.get("commits_last_month") or 0)
 
-    h_growth = (holders_now - holders_7d) / holders_7d if holders_7d > 0 else 0
+    h_growth = (holders_now - holders_7d) / holders_7d
     h_score  = holder_score(holders_now, holders_7d)
 
     dominant_narrative, narr_score = narrative_score(description, categories)

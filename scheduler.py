@@ -5,6 +5,7 @@ Cache JSON persistant sur disque.
 import time
 import json
 from pathlib import Path
+from filelock import FileLock, Timeout
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import REFRESH_INTERVAL_MINUTES, COINS_PAGES
@@ -25,23 +26,27 @@ scheduler = BackgroundScheduler()
 
 def _load_cache_from_disk() -> None:
     global ranking_cache, last_update
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            ranking_cache = saved.get("top", [])
-            last_update   = saved.get("last_update", "")
-            print(f"[Cache] {len(ranking_cache)} coins chargés ({last_update})")
-        except Exception as e:
-            print(f"[Cache] Erreur lecture: {e}")
+    lock = FileLock(CACHE_FILE.with_suffix('.lock'), timeout=1)
+    with lock:
+        if CACHE_FILE.exists():
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                ranking_cache = saved.get("top", [])
+                last_update   = saved.get("last_update", "")
+                print(f"[Cache] {len(ranking_cache)} coins chargés ({last_update})")
+            except Exception as e:
+                print(f"[Cache] Erreur lecture: {e}")
 
 
 def _save_cache_to_disk() -> None:
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_update": last_update, "top": ranking_cache}, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"[Cache] Erreur écriture: {e}")
+    lock = FileLock(CACHE_FILE.with_suffix('.lock'), timeout=1)
+    with lock:
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"last_update": last_update, "top": ranking_cache}, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Cache] Erreur écriture: {e}")
 
 
 def _upsert(coin: dict) -> None:
@@ -164,4 +169,4 @@ def start_scheduler() -> None:
     if not scheduler.running:
         scheduler.add_job(update_ranking, "interval", minutes=REFRESH_INTERVAL_MINUTES)
         scheduler.start()
-        print(f"[Scheduler] Démarré — refresh toutes les {REFRESH_INTERVAL_MINUTES} min")
+        print(f"[Scheduler] Démarré — refresh toutes les {REFRESH_INTERVAL_MINUTES} min — filelock activé")
